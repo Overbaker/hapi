@@ -47,6 +47,7 @@ import { resolveWorkspaceRoots } from '@/utils/workspaceRoot';
 import { hashRunnerCliApiToken, hashRunnerExtraHeaders } from './runnerIdentity';
 import { readRuntimes, runtimeMayBeAlive, runtimeAuthHash } from '@/codex/shared/registry';
 import { readWindowsProcessTable } from '@/utils/windowsProcessStop';
+import { startWrapperInventory, type WrapperInventory } from './wrapperInventory';
 import { ExitedProcessGroups } from './exitedProcessGroups';
 import { coalesceStopRequests, type StopSessionOptions } from './stopSessionRequests';
 import { scheduleCursorModelsPrewarm } from '@/modules/common/cursorModelsPrewarm';
@@ -261,10 +262,13 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
   const handoffFromPidRaw = process.env.HAPI_RUNNER_HANDOFF_FROM_PID;
   const handoffFromPid = handoffFromPidRaw ? Number(handoffFromPidRaw) : NaN;
   let isAuthorizedHandoff = false;
+  let handoffParent: { pid: number; startMarker: string } | undefined;
   if (Number.isFinite(handoffFromPid) && handoffFromPid > 0) {
     const existingState = await readRunnerState();
     if (existingState?.pid === handoffFromPid && isProcessAlive(handoffFromPid)) {
       isAuthorizedHandoff = true;
+      const startMarker = getProcessStartMarker(handoffFromPid);
+      if (startMarker !== null) handoffParent = { pid: handoffFromPid, startMarker };
       logger.debug(`[RUNNER RUN] Authorized handoff from parent runner PID ${handoffFromPid}; skipping stopRunner() and version-match short-circuit`);
     } else {
       logger.debug(`[RUNNER RUN] HAPI_RUNNER_HANDOFF_FROM_PID=${handoffFromPidRaw} set but no matching live parent in state (state.pid=${existingState?.pid ?? 'none'}); ignoring handoff signal`);
@@ -1202,6 +1206,63 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
       );
     }
 
+    let latestWrapperInventory: WrapperInventory | null = null;
+    let publishWrapperInventory: ((inventory: WrapperInventory) => void) | null = null;
+    const sessionOwnerPids = (sessionId: string): Set<number> => {
+      const pids = new Set<number>();
+      for (const [pid, session] of pidToTrackedSession) {
+        if (session.requestedHappySessionId === sessionId
+          || session.happySessionId === sessionId
+          || session.sharedSessions?.[sessionId]) pids.add(pid);
+      }
+      for (const [pid, record] of persistedResumeProcesses) {
+        if (record.requestedSessionId === sessionId || record.confirmedSessionId === sessionId) pids.add(pid);
+      }
+      for (const map of [pidToRequestedSessionId, pidToConfirmedSessionId, existingSessionIdByChildPid]) {
+        for (const [pid, id] of map) if (id === sessionId) pids.add(pid);
+      }
+      return pids;
+    };
+    const pendingStopsBySession = new Map<string, number>();
+    const startInventory = () => startWrapperInventory({
+      handoffParent,
+      isTracked: (pid) => pidToTrackedSession.has(pid)
+        || persistedResumeProcesses.has(pid)
+        || pidToRequestedSessionId.has(pid)
+        || existingSessionIdByChildPid.has(pid),
+      hasOtherLiveOwner: (sessionId, pid) => [...sessionOwnerPids(sessionId)]
+        .some(owner => owner !== pid && isProcessAlive(owner)),
+      adopt: ({ pid, sessionId, startMarker, flavor }) => {
+        if (pendingStopsBySession.has(sessionId) || pendingStopsBySession.has(`PID-${pid}`)
+          || intentionallyStoppedPids.has(pid) || pidToTrackedSession.has(pid) || persistedResumeProcesses.has(pid)) return false;
+        const bootId = getSystemBootId() ?? undefined;
+        if (probeRecoveredProcessGeneration(pid, { processStartMarker: startMarker, bootId }) !== 'verified') return false;
+        persistedResumeProcesses.set(pid, {
+          requestedSessionId: sessionId,
+          confirmedSessionId: sessionId,
+          pid,
+          processStartMarker: startMarker,
+          bootId,
+          flavor,
+        });
+        persistResumeProcesses();
+        pidToRequestedSessionId.set(pid, sessionId);
+        pidToConfirmedSessionId.set(pid, sessionId);
+        existingSessionIdByChildPid.set(pid, sessionId);
+        spawnSession.recoverChild(sessionId, { type: 'success', sessionId });
+        invalidateVerifiedExit(sessionId);
+        invalidateVerifiedExit(`PID-${pid}`);
+        logger.debug(`[RUNNER RUN] Adopted untracked wrapper PID ${pid} for session ${sessionId}`);
+        return true;
+      },
+      publish: (inventory) => {
+        latestWrapperInventory = inventory;
+        publishWrapperInventory?.(inventory);
+      },
+    });
+
+    let wrapperInventory = startInventory();
+
     // A stop (archive/switch/user stop) kills this session's child. Record the
     // owning PIDs before any kill so onChildExited treats their exit as
     // deliberate and does not report it as an unexpected child death.
@@ -1798,6 +1859,7 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
       const intentional = markIntentionalStop(sessionId);
       const terminated = new Set<number>();
       const groupCleanup = { verified: false, keepSharedWrapper: false };
+      pendingStopsBySession.set(sessionId, (pendingStopsBySession.get(sessionId) ?? 0) + 1);
       try {
         const status = await attemptStopSession(sessionId, opts, terminated, groupCleanup);
         if (status !== 'stopped' && status !== 'already_gone') return status;
@@ -1821,6 +1883,9 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
         }
         return status;
       } finally {
+        const remaining = pendingStopsBySession.get(sessionId)! - 1;
+        if (remaining) pendingStopsBySession.set(sessionId, remaining);
+        else pendingStopsBySession.delete(sessionId);
         for (const pid of intentional.marked) {
           if (!(intentional.withExitListener.has(pid) && terminated.has(pid))) intentionallyStoppedPids.delete(pid);
         }
@@ -2009,6 +2074,8 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
       requestShutdown: () => requestShutdown('hapi-app')
     });
 
+    publishWrapperInventory = (inventory) => apiMachine.publishWrapperInventory(inventory);
+    if (latestWrapperInventory) publishWrapperInventory(latestWrapperInventory);
     // Connect to server
     apiMachine.connect();
     // Route unexpected child exits to the hub on the same machine socket.
@@ -2208,6 +2275,7 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
           // child cannot write state (and thus cannot signal handoff
           // success) until it holds the lock, and the lock is ours until
           // we release.
+          wrapperInventory.stop();
           try {
             await releaseRunnerLock(runnerLockHandle);
           } catch (error) {
@@ -2237,6 +2305,7 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
               return;
             }
             runnerLockHandle = reacquired;
+            wrapperInventory = startInventory();
             deferHandoffRetry();
             return;
           }
@@ -2275,6 +2344,8 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
     // Setup signal handlers
     const cleanupAndShutdown = async (source: 'hapi-app' | 'hapi-cli' | 'os-signal' | 'exception', errorMessage?: string) => {
       logger.debug(`[RUNNER RUN] Starting proper cleanup (source: ${source}, errorMessage: ${errorMessage})...`);
+
+      wrapperInventory.stop();
 
       // Clear health check interval
       if (restartOnStaleVersionAndHeartbeat) {

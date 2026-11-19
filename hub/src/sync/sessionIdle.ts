@@ -15,7 +15,7 @@
  */
 
 import { SESSION_LIFECYCLE_IDLE, SESSION_LIFECYCLE_RUNNING, isLiveLifecycleState } from '@hapi/protocol'
-import type { Session } from '@hapi/protocol/types'
+import type { RunnerState, Session } from '@hapi/protocol/types'
 
 /** Keepalive-only for this long ⇒ reconcile `running` → `idle`. */
 export const DEFAULT_SESSION_IDLE_TIMEOUT_MS = 12 * 60 * 60 * 1000
@@ -148,6 +148,57 @@ export function resolveSessionHibernateMs(
     if (!Number.isSafeInteger(parsed)) return DEFAULT_SESSION_HIBERNATE_MS
     if (parsed === 0) return 0
     return Math.max(parsed, MIN_SESSION_HIBERNATE_MS)
+}
+
+/** Hibernation window for sessions whose wrapper runs a drifted binary. */
+export const DRIFT_HIBERNATE_IDLE_MS = 600_000
+
+/** A wrapper inventory older than this no longer proves drift. */
+export const WRAPPER_INVENTORY_FRESH_MS = 2 * 600_000
+
+export type DriftedWrappers = {
+    bySession: Set<string>
+    pids: Set<number>
+}
+
+/**
+ * Wrappers the runner reported as running a deleted / mismatched binary.
+ * Empty when the runner's inventory scan is older than WRAPPER_INVENTORY_FRESH_MS.
+ */
+export function driftedSessionIds(runnerState: RunnerState | null | undefined, now: number): DriftedWrappers {
+    const drifted: DriftedWrappers = { bySession: new Set(), pids: new Set() }
+    const inventory = runnerState?.wrapperInventory
+    if (!inventory || !(Math.abs(now - inventory.scannedAt) <= WRAPPER_INVENTORY_FRESH_MS)) return drifted
+    for (const item of inventory.reported) {
+        if (!item.drift) continue
+        drifted.pids.add(item.pid)
+        if (item.sessionId) drifted.bySession.add(item.sessionId)
+    }
+    return drifted
+}
+
+/**
+ * A session with a known host PID is drifted when that PID is a drifted
+ * wrapper, even if its argv omits the session ID or names another session.
+ * Without a host PID, fall back to the argv session ID. Shared Codex
+ * sessions remain excluded by shouldHibernate.
+ */
+export function isSessionDrifted(drifted: DriftedWrappers, session: Pick<Session, 'id' | 'metadata'>): boolean {
+    const hostPid = session.metadata?.hostPid
+    if (typeof hostPid === 'number') return drifted.pids.has(hostPid)
+    return drifted.bySession.has(session.id)
+}
+
+/**
+ * Window and reason for one session. Drift only shortens an enabled window;
+ * a disabled switch (`hibernateMs <= 0`) stays disabled.
+ */
+export function selectHibernationWindow(
+    hibernateMs: number,
+    drifted: boolean
+): { hibernateMs: number; reason: 'idle' | 'binary-drift' } {
+    if (!(hibernateMs > 0) || !drifted) return { hibernateMs, reason: 'idle' }
+    return { hibernateMs: Math.min(hibernateMs, DRIFT_HIBERNATE_IDLE_MS), reason: 'binary-drift' }
 }
 
 export const HIBERNATE_ELIGIBLE_FLAVORS = ['claude', 'codex', 'opencode', 'pi'] as const

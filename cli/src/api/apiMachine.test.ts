@@ -1098,3 +1098,168 @@ describe('ApiMachineClient child-exit notices', () => {
         }
     })
 })
+
+describe('ApiMachineClient wrapper inventory publishing', () => {
+    const inventory = (tracked: number) => ({
+        scannedAt: 1, enumerated: tracked, tracked, adopted: 0, reportedTotal: 0, reported: [],
+    })
+
+    it('advertises cached inventory once on connect and the latest scan on reconnect', async () => {
+        const client = new ApiMachineClient('cli-token', makeMachine('machine-inventory-connect'))
+        const handlers = new Map<string, () => void>()
+        let version = 0
+        const emitWithAck = vi.fn(async (_event: string, payload: { runnerState: unknown }) => ({
+            result: 'success', version: ++version, runnerState: payload.runnerState,
+        }))
+        const socket = {
+            connected: false,
+            on: (event: string, handler: () => void) => handlers.set(event, handler),
+            emit: vi.fn(), emitWithAck, close: vi.fn(),
+        }
+        ioMock.mockReturnValue(socket)
+        const first = inventory(1)
+        const latest = { ...first, scannedAt: 2 }
+        try {
+            client.publishWrapperInventory(first)
+            client.connect()
+            expect(emitWithAck).not.toHaveBeenCalled()
+            socket.connected = true
+            handlers.get('connect')!()
+            await new Promise(resolve => setImmediate(resolve))
+            expect(emitWithAck).toHaveBeenCalledTimes(1)
+            expect(emitWithAck).toHaveBeenNthCalledWith(1, 'machine-update-state', expect.objectContaining({
+                runnerState: expect.objectContaining({ wrapperInventory: first }),
+            }))
+
+            client.publishWrapperInventory(latest)
+            await new Promise(resolve => setImmediate(resolve))
+            expect(emitWithAck).toHaveBeenCalledTimes(1)
+            socket.connected = false
+            handlers.get('disconnect')!()
+            socket.connected = true
+            handlers.get('connect')!()
+            await new Promise(resolve => setImmediate(resolve))
+            expect(emitWithAck).toHaveBeenCalledTimes(2)
+            expect(emitWithAck).toHaveBeenNthCalledWith(2, 'machine-update-state', expect.objectContaining({
+                runnerState: expect.objectContaining({ wrapperInventory: latest }),
+            }))
+        } finally {
+            client.shutdown()
+        }
+    })
+
+    it('retries a connect write with the latest scan after a concurrent inventory publish', async () => {
+        const client = new ApiMachineClient('cli-token', makeMachine('machine-inventory-retry'))
+        const handlers = new Map<string, () => void>()
+        let version = 0
+        const emitWithAck = vi.fn(async (_event: string, payload: { runnerState: unknown }) => ({
+            result: 'success', version: ++version, runnerState: payload.runnerState,
+        }))
+        let rejectConnect!: (error: Error) => void
+        emitWithAck.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectConnect = reject }))
+        const socket = {
+            connected: false,
+            on: (event: string, handler: () => void) => handlers.set(event, handler),
+            emit: vi.fn(), emitWithAck, close: vi.fn(),
+        }
+        ioMock.mockReturnValue(socket)
+        try {
+            client.publishWrapperInventory(inventory(1))
+            client.connect()
+            socket.connected = true
+            handlers.get('connect')!()
+            client.publishWrapperInventory(inventory(2))
+            await new Promise(resolve => setImmediate(resolve))
+            expect(emitWithAck).toHaveBeenCalledTimes(2)
+            rejectConnect(new Error('version mismatch'))
+            await vi.waitFor(() => expect(emitWithAck.mock.calls.length).toBeGreaterThanOrEqual(3))
+            expect(emitWithAck.mock.calls[2]![1].runnerState).toMatchObject({ wrapperInventory: inventory(2) })
+            expect(emitWithAck).toHaveBeenCalledTimes(3)
+        } finally {
+            client.shutdown()
+        }
+    })
+
+    it('releases an interrupted publish without buffering a retry on the disconnected socket', async () => {
+        const client = new ApiMachineClient('cli-token', makeMachine('machine-inventory-disconnect'))
+        const emitWithAck = vi.fn(async (_event: string, payload: { runnerState: unknown }) => ({
+            result: 'success', version: 1, runnerState: payload.runnerState,
+        }))
+        const socket = { connected: true, emitWithAck }
+        ;(client as unknown as { socket: typeof socket }).socket = socket
+        emitWithAck.mockImplementationOnce(async () => {
+            socket.connected = false
+            throw new Error('socket has been disconnected')
+        })
+        client.publishWrapperInventory(inventory(1))
+        await new Promise(resolve => setImmediate(resolve))
+        expect(emitWithAck).toHaveBeenCalledTimes(1)
+
+        socket.connected = true
+        client.publishWrapperInventory(inventory(2))
+        await new Promise(resolve => setImmediate(resolve))
+        expect(emitWithAck).toHaveBeenCalledTimes(2)
+        expect(emitWithAck.mock.calls[1]![1].runnerState).toMatchObject({ wrapperInventory: inventory(2) })
+    })
+
+    it('emits only while connected and only when the inventory changed', async () => {
+        const client = new ApiMachineClient('cli-token', makeMachine('machine-inventory'))
+        let version = 0
+        const emitWithAck = vi.fn(async (_event: string, payload: { runnerState: unknown }) => {
+            version += 1
+            return { result: 'success', version, runnerState: payload.runnerState }
+        })
+        const socket = { connected: false, emitWithAck }
+        ;(client as unknown as { socket: typeof socket }).socket = socket
+
+        client.publishWrapperInventory(inventory(1))
+        await Promise.resolve()
+        expect(emitWithAck).not.toHaveBeenCalled()
+
+        socket.connected = true
+        client.publishWrapperInventory(inventory(1))
+        await vi.waitFor(() => expect(emitWithAck).toHaveBeenCalledTimes(1))
+        expect(emitWithAck.mock.calls[0]![1].runnerState).toMatchObject({ wrapperInventory: inventory(1) })
+
+        client.publishWrapperInventory({ ...inventory(1), scannedAt: 2 })
+        await new Promise((resolve) => setImmediate(resolve))
+        expect(emitWithAck).toHaveBeenCalledTimes(1)
+
+        client.publishWrapperInventory(inventory(2))
+        await vi.waitFor(() => expect(emitWithAck).toHaveBeenCalledTimes(2))
+    })
+
+    it('does not retry a failed publish in a backoff loop', async () => {
+        const client = new ApiMachineClient('cli-token', makeMachine('machine-inventory-fail'))
+        const emitWithAck = vi.fn(async () => ({ result: 'error', reason: 'nope' }))
+        ;(client as unknown as { socket: unknown }).socket = { connected: true, emitWithAck }
+        client.publishWrapperInventory(inventory(1))
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        expect(emitWithAck).toHaveBeenCalledTimes(2)
+        await new Promise((resolve) => setTimeout(resolve, 600))
+        expect(emitWithAck).toHaveBeenCalledTimes(2)
+    })
+})
+
+describe('ApiMachineClient wrapper inventory drift refresh', () => {
+    it('re-sends an unchanged inventory with drift once its last sent scan is stale', async () => {
+        const client = new ApiMachineClient('cli-token', makeMachine('machine-inventory-drift'))
+        let version = 0
+        const emitWithAck = vi.fn(async (_event: string, payload: { runnerState: unknown }) => {
+            version += 1
+            return { result: 'success', version, runnerState: payload.runnerState }
+        })
+        ;(client as unknown as { socket: unknown }).socket = { connected: true, emitWithAck }
+        const drifted = (scannedAt: number) => ({
+            scannedAt, enumerated: 1, tracked: 0, adopted: 0, reportedTotal: 1,
+            reported: [{ pid: 9, sessionId: 's', drift: 'deleted' as const, reason: 'drift' }],
+        })
+        client.publishWrapperInventory(drifted(1_000))
+        await vi.waitFor(() => expect(emitWithAck).toHaveBeenCalledTimes(1))
+        client.publishWrapperInventory(drifted(2_000))
+        await new Promise((resolve) => setImmediate(resolve))
+        expect(emitWithAck).toHaveBeenCalledTimes(1)
+        client.publishWrapperInventory(drifted(1_000 + 600_000))
+        await vi.waitFor(() => expect(emitWithAck).toHaveBeenCalledTimes(2))
+    })
+})
